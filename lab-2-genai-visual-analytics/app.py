@@ -28,6 +28,11 @@ import plotly.express as px
 import streamlit as st
 
 from sample_data import generate_sample_dataset
+from chart_provenance import (
+    build_chart_provenance,
+    provenance_to_prompt_block,
+    filter_flags_to_columns,
+)
 
 
 # ----------------------------------------------------------------------
@@ -131,29 +136,51 @@ CHART_TOOLS = [
 # ----------------------------------------------------------------------
 
 def render_chart_from_tool_call(tool_name: str, args: dict, df: pd.DataFrame):
-    """Take a tool-use request from the LLM and return a Plotly figure."""
+    """Turn a tool-use request into (figure, plotted_data).
+
+    plotted_data is the frame actually behind the chart, so the caption
+    can read real values instead of describing chart anatomy.
+    """
     if tool_name == "create_bar_chart":
         # Aggregate before plotting so the bar represents the requested statistic.
         agg = args.get("aggregation", "mean")
-        grouped = df.groupby(args["x_column"])[args["y_column"]].agg(agg).reset_index()
-        return px.bar(grouped, x=args["x_column"], y=args["y_column"], title=args["title"])
+        y = args["y_column"]
+        work = df.copy()
+        # Coerce explicitly so aggregation is deliberate rather than
+        # accidental, and so counts match build_chart_provenance.
+        work[y] = pd.to_numeric(work[y], errors="coerce")
+        grouped = work.groupby(args["x_column"])[y].agg(agg).reset_index()
+        return px.bar(grouped, x=args["x_column"], y=y, title=args["title"]), grouped
 
     if tool_name == "create_line_chart":
         color = args.get("color_column") or None
-        return px.line(df, x=args["x_column"], y=args["y_column"], color=color, title=args["title"])
+        fig = px.line(df, x=args["x_column"], y=args["y_column"], color=color, title=args["title"])
+        cols = [c for c in [args["x_column"], args["y_column"], color] if c]
+        return fig, df[cols]
 
     if tool_name == "create_scatter_chart":
         color = args.get("color_column") or None
-        return px.scatter(df, x=args["x_column"], y=args["y_column"], color=color, title=args["title"])
+        fig = px.scatter(df, x=args["x_column"], y=args["y_column"], color=color, title=args["title"])
+        cols = [c for c in [args["x_column"], args["y_column"], color] if c]
+        return fig, df[cols]
 
     if tool_name == "create_histogram":
-        return px.histogram(df, x=args["column"], title=args["title"])
+        return px.histogram(df, x=args["column"], title=args["title"]), df[[args["column"]]]
 
     if tool_name == "create_box_plot":
         group = args.get("group_column") or None
-        return px.box(df, x=group, y=args["value_column"], title=args["title"])
+        fig = px.box(df, x=group, y=args["value_column"], title=args["title"])
+        cols = [c for c in [group, args["value_column"]] if c]
+        return fig, df[cols]
 
     raise ValueError(f"Unknown chart tool: {tool_name}")
+
+
+def summarize_plotted_data(plotted: pd.DataFrame, max_rows: int = 30) -> str:
+    """Small frames go in whole; large ones go in as descriptive statistics."""
+    if len(plotted) <= max_rows:
+        return plotted.to_string(index=False)
+    return f"({len(plotted)} rows — summary statistics)\n{plotted.describe().to_string()}"
 
 
 # ----------------------------------------------------------------------
@@ -257,7 +284,7 @@ def get_data_quality_concerns(df_signature: str, schema_text: str, profile_text:
         return [{"severity": "low", "description": f"Could not parse data quality response: {raw[:200]}"}]
 
 
-def analyze_question(question: str, df: pd.DataFrame, schema_text: str):
+def analyze_question(question: str, df: pd.DataFrame, schema_text: str, concerns: list):
     """Use tool calling to pick a chart, render it, then ask for a caption."""
     client = get_client()
 
@@ -287,11 +314,22 @@ def analyze_question(question: str, df: pd.DataFrame, schema_text: str):
 
     # Step 2: render the chart deterministically in Python.
     try:
-        figure = render_chart_from_tool_call(tool_call.name, dict(tool_call.input), df)
+        figure, plotted = render_chart_from_tool_call(tool_call.name, dict(tool_call.input), df)
     except Exception as exc:
         return {"figure": None, "caption": f"Tried to build a {tool_call.name} but hit an error: {exc}"}
 
-    # Step 3: ask for a one-paragraph narrative caption that explains what the chart shows.
+    # Step 2b: compute provenance in pandas. Never ask the model for counts.
+    args = dict(tool_call.input)
+    y_col = args.get("y_column") or args.get("value_column") or args.get("column")
+    x_col = args.get("x_column") or args.get("group_column")
+
+    facts = build_chart_provenance(
+        df, y_column=y_col, x_column=x_col, aggregation=args.get("aggregation")
+    )
+    relevant = filter_flags_to_columns(concerns, [c for c in [y_col, x_col] if c])
+    provenance_block = provenance_to_prompt_block(facts, relevant_flags=relevant)
+
+    # Step 3: caption, grounded in real values and known defects.
     caption_response = client.messages.create(
         model=MODEL,
         max_tokens=300,
@@ -299,12 +337,17 @@ def analyze_question(question: str, df: pd.DataFrame, schema_text: str):
             "role": "user",
             "content": (
                 f"A user asked: '{question}'\n\n"
-                f"In response, we produced a {tool_call.name} with these parameters:\n"
-                f"{json.dumps(dict(tool_call.input), indent=2)}\n\n"
-                f"Dataset summary:\n{schema_text}\n\n"
-                "Write a short, plain-English caption (2-3 sentences) explaining what this "
-                "chart shows and what an analyst might notice. Do not invent numbers you "
-                "cannot see; describe what the chart is structured to reveal."
+                f"Chart rendered: {tool_call.name}\n"
+                f"Parameters:\n{json.dumps(args, indent=2)}\n\n"
+                f"The values actually plotted:\n{summarize_plotted_data(plotted)}\n\n"
+                f"How this was computed:\n{provenance_block}\n\n"
+                "Write a 2-3 sentence caption that:\n"
+                "- states what the data shows, naming specific groups and values\n"
+                "- states the basis of calculation and any limits listed above\n"
+                "- does NOT explain what this chart type is or how to read it\n"
+                "- does NOT claim the figures reflect all samples if rows were excluded\n\n"
+                "Use only the figures given above. Do not estimate or infer any "
+                "number that does not appear there."
             ),
         }],
     )
@@ -313,7 +356,8 @@ def analyze_question(question: str, df: pd.DataFrame, schema_text: str):
         "figure": figure,
         "caption": caption_response.content[0].text,
         "tool_name": tool_call.name,
-        "tool_args": dict(tool_call.input),
+        "tool_args": args,
+        "provenance": provenance_block,
     }
 
 
@@ -421,11 +465,14 @@ user_question = st.text_input("Your question:", placeholder="e.g., How does temp
 
 if user_question:
     with st.spinner("Thinking..."):
-        result = analyze_question(user_question, df, schema_text)
+        result = analyze_question(user_question, df, schema_text, concerns)
 
     if result.get("figure") is not None:
         st.plotly_chart(result["figure"], use_container_width=True)
         with st.expander("How was this chart selected? (LLM tool call detail)"):
             st.code(f"Tool: {result['tool_name']}\nArguments: {json.dumps(result['tool_args'], indent=2)}")
+        if result.get("provenance"):
+            with st.expander("What went into this calculation? (data quality provenance)"):
+                st.markdown(result["provenance"])
 
     st.markdown(f"**Caption:** {result['caption']}")
